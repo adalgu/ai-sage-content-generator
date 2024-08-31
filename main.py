@@ -9,14 +9,17 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import tiktoken
-
+from notion_client import Client
 
 # .env 파일에서 환경 변수 로드
 load_dotenv()
 
+# Notion 클라이언트 설정
+notion = Client(auth=os.getenv("NOTION_TOKEN"))
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+
+
 # 상태 정의
-
-
 class ConversationState(BaseModel):
     topic: str
     messages: List[Dict[str, str]] = Field(default_factory=list)
@@ -25,6 +28,11 @@ class ConversationState(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cost: float = 0.0
+    title: str = ""
+    subtitle: str = ""
+    description: str = ""
+    slug: str = ""
+    notion_url: str = ""  # 새로운 필드 추가
 
 # AI 현인 페르소나 정의
 
@@ -178,7 +186,11 @@ def summarize_conversation(state: ConversationState):
 def generate_final_content(state: ConversationState):
     full_conversation = "\n".join(
         [f"{msg['role']}: {msg['content']}" for msg in state.messages])
-    prompt = f"다음 대화를 정리하여 뉴욕타임즈 스타일의 기사를 작성해 보세요. 대화 내용은 다음과 같습니다:\n\n{full_conversation}\n\n이 대화를 바탕으로 뉴욕타임즈 스타일의 기사를 작성해주세요."
+    prompt = f"""다음 대화를 정리하여 뉴욕타임즈 스타일의 기사를 작성해 보세요. 대화 내용은 다음과 같습니다:
+
+{full_conversation}
+
+이 대화를 바탕으로 뉴욕타임즈 스타일의 기사 본문을 작성해주세요."""
 
     input_tokens = count_tokens(prompt)
     response = model.invoke(prompt)
@@ -189,27 +201,153 @@ def generate_final_content(state: ConversationState):
         topic=state.topic,
         messages=state.messages,
         summary=state.summary,
-        content=response.content,
+        content=response.content.strip(),
         input_tokens=state.input_tokens + input_tokens,
         output_tokens=state.output_tokens + output_tokens,
         cost=state.cost + new_cost
     )
 
-# 상태 전이 함수
+
+def generate_metadata(state: ConversationState):
+    prompt = f"""다음 기사 내용을 바탕으로 제목, 부제목, 설명, 그리고 슬러그를 생성해주세요:
+
+{state.content[:500]}...  # 내용이 너무 길 경우 앞부분만 사용
+
+각 항목을 다음과 같은 형식으로 제공해주세요:
+제목: [여기에 제목 입력]
+부제목: [여기에 부제목 입력]
+요약: [여기에 요약 입력]
+슬러그: [여기에 슬러그 입력]"""
+
+    try:
+        input_tokens = count_tokens(prompt)
+        response = model.invoke(prompt)
+        output_tokens = count_tokens(response.content)
+        new_cost = calculate_cost(input_tokens, output_tokens, model_name)
+
+        # 응답에서 각 항목 추출
+        lines = response.content.strip().split("\n")
+        metadata = {}
+        for line in lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                metadata[key.strip().lower()] = value.strip()
+
+        # 기본값 설정
+        default_title = state.topic or "무제"
+        default_subtitle = "AI가 생성한 기사"
+        default_description = state.content[:100] + \
+            "..." if state.content else "내용 없음"
+        default_slug = "-".join(default_title.lower().split()[:5])
+
+        return ConversationState(
+            topic=state.topic,
+            messages=state.messages,
+            summary=state.summary,
+            content=state.content,
+            input_tokens=state.input_tokens + input_tokens,
+            output_tokens=state.output_tokens + output_tokens,
+            cost=state.cost + new_cost,
+            title=metadata.get('제목', default_title),
+            subtitle=metadata.get('부제목', default_subtitle),
+            description=metadata.get('요약', default_description),
+            slug=metadata.get('슬러그', default_slug)
+        )
+    except Exception as e:
+        print(f"메타데이터 생성 중 오류 발생: {str(e)}")
+        return ConversationState(
+            topic=state.topic,
+            messages=state.messages,
+            summary=state.summary,
+            content=state.content,
+            input_tokens=state.input_tokens,
+            output_tokens=state.output_tokens,
+            cost=state.cost,
+            title=state.topic or "무제",
+            subtitle="AI가 생성한 기사",
+            description=state.content[:100] +
+            "..." if state.content else "내용 없음",
+            slug="-".join((state.topic or "무제").lower().split()[:5])
+        )
 
 
-def should_continue(state: ConversationState):
-    if not evaluate_conversation(state):
-        return "continue"
-    elif not state.summary:
-        return "summarize"
-    elif not state.content:
-        return "generate"
-    else:
-        return "end"
+def save_to_notion(state: ConversationState):
+    """노션에 생성된 콘텐츠를 저장합니다."""
+    try:
+        # Notion 데이터베이스의 속성 구조 확인
+        database = notion.databases.retrieve(NOTION_DATABASE_ID)
+        properties = database.get('properties', {})
+
+        # 페이지 속성 준비
+        page_properties = {}
+
+        # 제목 필드 찾기 및 설정
+        title_field = next((k for k, v in properties.items()
+                           if v['type'] == 'title'), None)
+        if not title_field:
+            raise ValueError("Title field not found in the database")
+
+        page_properties[title_field] = {
+            "title": [{"text": {"content": state.title}}]}
+
+        # 다른 필드들 설정
+        for field, value in [('Subtitle', state.subtitle), ('Description', state.description), ('Slug', state.slug)]:
+            if field in properties:
+                page_properties[field] = {
+                    "rich_text": [{"text": {"content": value}}]}
+
+        # 페이지 생성
+        new_page = notion.pages.create(
+            parent={"database_id": NOTION_DATABASE_ID},
+            properties=page_properties,
+            children=[
+                {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{"type": "text", "text": {"content": state.content}}]
+                    }
+                }
+            ]
+        )
+        notion_url = f"https://www.notion.so/{new_page['id'].replace('-', '')}"
+
+        # 상태 업데이트
+        return ConversationState(
+            topic=state.topic,
+            messages=state.messages,
+            summary=state.summary,
+            content=state.content,
+            input_tokens=state.input_tokens,
+            output_tokens=state.output_tokens,
+            cost=state.cost,
+            title=state.title,
+            subtitle=state.subtitle,
+            description=state.description,
+            slug=state.slug,
+            notion_url=notion_url  # 새로운 필드 추가
+        )
+    except Exception as e:
+        print(f"Notion에 저장 중 오류 발생: {str(e)}")
+        # 오류 발생 시에도 상태 반환
+        return ConversationState(
+            topic=state.topic,
+            messages=state.messages,
+            summary=state.summary,
+            content=state.content,
+            input_tokens=state.input_tokens,
+            output_tokens=state.output_tokens,
+            cost=state.cost,
+            title=state.title,
+            subtitle=state.subtitle,
+            description=state.description,
+            slug=state.slug,
+            notion_url="Notion 저장 실패"  # 오류 메시지
+        )
+
+# 워크플로우 수정
 
 
-# 그래프 정의 수정
 def create_workflow(sages: List[AISage]):
     workflow = StateGraph(ConversationState)
     workflow.add_node("initiate", initiate_conversation)
@@ -217,6 +355,8 @@ def create_workflow(sages: List[AISage]):
         "continue", lambda state: continue_conversation(state, sages))
     workflow.add_node("summarize", summarize_conversation)
     workflow.add_node("generate", generate_final_content)
+    workflow.add_node("generate_metadata", generate_metadata)
+    workflow.add_node("save_to_notion", save_to_notion)
 
     workflow.set_entry_point("initiate")
 
@@ -251,9 +391,25 @@ def create_workflow(sages: List[AISage]):
         }
     )
 
-    workflow.add_edge("generate", END)
+    workflow.add_edge("generate", "generate_metadata")
+    workflow.add_edge("generate_metadata", "save_to_notion")
+    workflow.add_edge("save_to_notion", END)
 
     return workflow.compile()
+
+
+# 상태 전이 함수
+
+
+def should_continue(state: ConversationState):
+    if not evaluate_conversation(state):
+        return "continue"
+    elif not state.summary:
+        return "summarize"
+    elif not state.content:
+        return "generate"
+    else:
+        return "end"
 
 
 # 채팅 메시지 출력 함수
@@ -268,8 +424,9 @@ def print_chat_message(message: Dict[str, str], color: str):
     print("-" * 50)  # 구분선
     time.sleep(1)  # 1초 대기
 
-
 # 메인 함수 수정
+
+
 def main():
     print("AI 현인 콘텐츠 생성기 테스트")
 
@@ -300,15 +457,17 @@ def main():
     result = graph.invoke({"topic": final_topic})
 
     print("\n생성된 뉴욕타임즈 스타일 기사:")
-    if isinstance(result, dict):
-        if 'content' in result:
-            print(result['content'])
-        else:
-            print("콘텐츠를 찾을 수 없습니다.")
-
-        print(f"\n총 입력 토큰: {result.get('input_tokens', 'N/A')}")
-        print(f"총 출력 토큰: {result.get('output_tokens', 'N/A')}")
-        print(f"총 비용: ${result.get('cost', 0):.4f}")
+    if isinstance(result, ConversationState):
+        print(f"제목: {result.title}")
+        print(f"부제목: {result.subtitle}")
+        print(f"설명: {result.description}")
+        print(f"슬러그: {result.slug}")
+        print("\n본문:")
+        print(result.content)
+        print(f"\n총 입력 토큰: {result.input_tokens}")
+        print(f"총 출력 토큰: {result.output_tokens}")
+        print(f"총 비용: ${result.cost:.4f}")
+        print(f"\n노션 페이지 URL: {result.notion_url}")
     else:
         print("예상치 못한 결과 형식입니다.")
         print(result)  # 디버깅을 위해 전체 결과 출력
@@ -316,69 +475,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# # 메인 함수 수정
-
-
-# def main():
-#     print("AI 현인 콘텐츠 생성기 테스트")
-
-#     # JSON 파일에서 페르소나 로드
-#     personas = load_personas('personas.json')
-
-#     # 사용자가 페르소나 선택
-#     selected_personas = select_personas(personas)
-
-#     print("1. 주제 직접 입력")
-#     print("2. URL 입력")
-#     print("3. 자동 주제 선택")
-#     choice = input("선택하세요 (1/2/3): ")
-
-#     if choice == "1":
-#         topic = input("주제를 입력하세요: ")
-#     elif choice == "2":
-#         topic = input("URL을 입력하세요: ")
-#     else:
-#         topic = None
-
-#     # get_topic 함수를 사용하여 항상 유효한 문자열 주제를 얻습니다
-#     final_topic = get_topic(topic)
-#     print(f"\n선택된 주제: {final_topic}\n")
-
-#     print("대화 시작...")
-#     graph = create_workflow(selected_personas)
-#     result = graph.invoke({"topic": final_topic})
-
-#     print("\n생성된 뉴욕타임즈 스타일 기사:")
-#     if isinstance(result, dict) and 'ConversationState' in result:
-#         state = result['ConversationState']
-#         if isinstance(state, ConversationState):
-#             print(state.content)
-#             print(f"\n총 입력 토큰: {state.input_tokens}")
-#             print(f"총 출력 토큰: {state.output_tokens}")
-#             print(f"총 비용: ${state.cost:.4f}")
-#         elif isinstance(state, dict):
-#             print(state.get('content', '콘텐츠를 찾을 수 없습니다.'))
-#             print(f"\n총 입력 토큰: {state.get('input_tokens', 'N/A')}")
-#             print(f"총 출력 토큰: {state.get('output_tokens', 'N/A')}")
-#             print(f"총 비용: ${state.get('cost', 0):.4f}")
-#     else:
-#         print("예상치 못한 결과 형식입니다.")
-#         print(result)  # 디버깅을 위해 전체 결과 출력
-
-#     # 토큰 사용량과 비용 출력
-#     if isinstance(result, dict) and 'ConversationState' in result:
-#         state = result['ConversationState']
-#         if isinstance(state, ConversationState):
-#             print(f"\n총 입력 토큰: {state.input_tokens}")
-#             print(f"총 출력 토큰: {state.output_tokens}")
-#             print(f"총 비용: ${state.cost:.4f}")
-#         elif isinstance(state, dict):
-#             print(f"\n총 입력 토큰: {state.get('input_tokens', 'N/A')}")
-#             print(f"총 출력 토큰: {state.get('output_tokens', 'N/A')}")
-#             print(f"총 비용: ${state.get('cost', 0):.4f}")
-#     else:
-#         print("\n토큰 사용량과 비용을 계산할 수 없습니다.")
-
-
-# if __name__ == "__main__":
-#     main()
