@@ -18,9 +18,19 @@ from typing import List, Dict, Any
 # .env 파일에서 환경 변수 로드
 load_dotenv()
 
-# Notion 클라이언트 설정
-notion = Client(auth=os.getenv("NOTION_TOKEN"))
+# Notion 클라이언트 설정 (선택적)
+notion = None
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+
+if NOTION_TOKEN and NOTION_DATABASE_ID:
+    try:
+        notion = Client(auth=NOTION_TOKEN)
+        # Streamlit에서는 print 대신 세션 상태에 저장
+        # (나중에 UI에 표시하기 위해)
+    except Exception as e:
+        # Streamlit에서는 st.warning을 사용하지만 여기서는 초기화 단계이므로 패스
+        pass
 
 # 상태 정의
 
@@ -283,6 +293,23 @@ def generate_metadata(state: ConversationState):
 
 
 def save_to_notion(state: ConversationState):
+    # Notion이 설정되지 않은 경우
+    if not notion or not NOTION_DATABASE_ID:
+        return ConversationState(
+            topic=state.topic,
+            messages=state.messages,
+            summary=state.summary,
+            content=state.content,
+            input_tokens=state.input_tokens,
+            output_tokens=state.output_tokens,
+            cost=state.cost,
+            title=state.title,
+            subtitle=state.subtitle,
+            description=state.description,
+            slug=state.slug,
+            notion_url="Notion 미설정"
+        )
+
     try:
         database = notion.databases.retrieve(NOTION_DATABASE_ID)
         properties = database.get('properties', {})
