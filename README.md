@@ -41,7 +41,7 @@ The AI Sage Content Generator is a Streamlit-based web application that generate
 1. **Clone this repository:**
 
 ```bash
-git clone https://github.com/your-username/ai-sage-content-generator.git
+git clone https://github.com/adalgu/ai-sage-content-generator.git
 ```
 
 2. **Navigate to the project directory:**
