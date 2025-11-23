@@ -29,8 +29,9 @@ if NOTION_TOKEN and NOTION_DATABASE_ID:
         # Streamlit에서는 print 대신 세션 상태에 저장
         # (나중에 UI에 표시하기 위해)
     except Exception as e:
+        import logging
+        logging.warning(f"Notion 클라이언트 초기화 실패: {e}")
         # Streamlit에서는 st.warning을 사용하지만 여기서는 초기화 단계이므로 패스
-        pass
 
 # 상태 정의
 
