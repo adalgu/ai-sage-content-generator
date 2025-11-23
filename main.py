@@ -14,9 +14,20 @@ from notion_client import Client
 # .env 파일에서 환경 변수 로드
 load_dotenv()
 
-# Notion 클라이언트 설정
-notion = Client(auth=os.getenv("NOTION_TOKEN"))
+# Notion 클라이언트 설정 (선택적)
+notion = None
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+
+if NOTION_TOKEN and NOTION_DATABASE_ID:
+    try:
+        notion = Client(auth=NOTION_TOKEN)
+        print("✓ Notion 통합이 활성화되었습니다.")
+    except Exception as e:
+        print(f"⚠ Notion 클라이언트 초기화 실패: {str(e)}")
+        print("  Notion 없이 계속 진행합니다.")
+else:
+    print("ℹ Notion 설정이 없습니다. Notion 저장 기능은 비활성화됩니다.")
 
 
 # 상태 정의
@@ -273,6 +284,24 @@ def generate_metadata(state: ConversationState):
 
 def save_to_notion(state: ConversationState):
     """노션에 생성된 콘텐츠를 저장합니다."""
+    # Notion이 설정되지 않은 경우
+    if not notion or not NOTION_DATABASE_ID:
+        print("ℹ Notion 설정이 없어 저장을 건너뜁니다.")
+        return ConversationState(
+            topic=state.topic,
+            messages=state.messages,
+            summary=state.summary,
+            content=state.content,
+            input_tokens=state.input_tokens,
+            output_tokens=state.output_tokens,
+            cost=state.cost,
+            title=state.title,
+            subtitle=state.subtitle,
+            description=state.description,
+            slug=state.slug,
+            notion_url="Notion 미설정"
+        )
+
     try:
         # Notion 데이터베이스의 속성 구조 확인
         database = notion.databases.retrieve(NOTION_DATABASE_ID)
